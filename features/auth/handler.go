@@ -1,10 +1,6 @@
 package auth
 
 import (
-	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"net/http"
 	"time"
 
@@ -15,6 +11,7 @@ import (
 	"github.com/newsand/base-login/internal/db"
 	"github.com/newsand/base-login/internal/logger"
 	"github.com/newsand/base-login/internal/middleware"
+	"github.com/newsand/base-login/internal/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -60,16 +57,14 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
 	lockoutKey := "login:" + req.Email
-
-	if middleware.CheckLockout(ctx, lockoutKey) {
+	if middleware.CheckLockout(c.Request.Context(), lockoutKey) {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "account temporarily locked"})
 		return
 	}
 
-	user, err := getUserByEmail(ctx, req.Email)
-	if err != nil {
+	var user models.User
+	if err := db.DB().Where("email = ?", req.Email).First(&user).Error; err != nil {
 		middleware.RecordFailedAttempt(lockoutKey)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
@@ -94,7 +89,7 @@ func Login(c *gin.Context) {
 	middleware.ClearLockout(lockoutKey)
 
 	if user.TwoFAEnabled && user.TwoFASecret != nil {
-		challengeToken, err := createTwoFAChallenge(ctx, user.ID)
+		challengeToken, err := createTwoFAChallenge(user.ID)
 		if err != nil {
 			logger.Error("Failed to create 2FA challenge: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -107,7 +102,7 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	tokens, err := issueTokens(ctx, user.ID)
+	tokens, err := issueTokens(user.ID)
 	if err != nil {
 		logger.Error("Failed to issue tokens: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -124,11 +119,10 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	tokenHash := hashToken(req.RefreshToken)
+	tokenHash := models.HashToken(req.RefreshToken)
 
-	refresh, err := getRefreshToken(ctx, tokenHash)
-	if err != nil {
+	var refresh models.RefreshToken
+	if err := db.DB().Where("token_hash = ?", tokenHash).First(&refresh).Error; err != nil {
 		logger.Debug("Refresh token not found: %v", err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
 		return
@@ -136,9 +130,9 @@ func Refresh(c *gin.Context) {
 
 	if refresh.RevokedAt != nil {
 		logger.Warn("Reuse detection: revoking family %s", refresh.FamilyID)
-		if err := revokeFamily(ctx, refresh.FamilyID); err != nil {
-			logger.Error("Failed to revoke family: %v", err)
-		}
+		db.DB().Model(&models.RefreshToken{}).
+			Where("family_id = ? AND revoked_at IS NULL", refresh.FamilyID).
+			Update("revoked_at", time.Now())
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
 		return
 	}
@@ -148,11 +142,10 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
-	if err := revokeRefreshToken(ctx, refresh.ID); err != nil {
-		logger.Error("Failed to revoke old refresh token: %v", err)
-	}
+	now := time.Now()
+	db.DB().Model(&refresh).Update("revoked_at", now)
 
-	tokens, err := issueTokensWithFamily(ctx, refresh.UserID, refresh.FamilyID)
+	tokens, err := issueTokensWithFamily(refresh.UserID, refresh.FamilyID)
 	if err != nil {
 		logger.Error("Failed to issue tokens: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -165,12 +158,9 @@ func Refresh(c *gin.Context) {
 func Logout(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 
-	ctx := c.Request.Context()
-	if err := revokeAllUserRefreshTokens(ctx, userID.(string)); err != nil {
-		logger.Error("Failed to revoke refresh tokens: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
+	db.DB().Model(&models.RefreshToken{}).
+		Where("user_id = ? AND revoked_at IS NULL", userID).
+		Update("revoked_at", time.Now())
 
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }
@@ -178,9 +168,8 @@ func Logout(c *gin.Context) {
 func GetMe(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 
-	ctx := c.Request.Context()
-	user, err := getUserByID(ctx, userID.(string))
-	if err != nil {
+	var user models.User
+	if err := db.DB().First(&user, "id = ?", userID).Error; err != nil {
 		logger.Error("Failed to get user: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
@@ -201,24 +190,18 @@ func RequestMagicLink(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	user, err := getUserByEmail(ctx, req.Email)
-	if err != nil {
+	var user models.User
+	if err := db.DB().Where("email = ?", req.Email).First(&user).Error; err != nil {
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a magic link will be sent"})
 		return
 	}
 
-	if user.DisabledAt != nil {
+	if user.DisabledAt != nil || user.PasswordHash == nil {
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a magic link will be sent"})
 		return
 	}
 
-	if user.PasswordHash == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a magic link will be sent"})
-		return
-	}
-
-	token, err := createMagicToken(ctx, user.ID)
+	token, err := createMagicToken(user.ID)
 	if err != nil {
 		logger.Error("Failed to create magic token: %v", err)
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a magic link will be sent"})
@@ -240,11 +223,10 @@ func ConsumeMagicLink(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	tokenHash := hashToken(req.Token)
+	tokenHash := models.HashToken(req.Token)
 
-	magic, err := getMagicToken(ctx, tokenHash)
-	if err != nil {
+	var magic models.MagicToken
+	if err := db.DB().Where("token_hash = ?", tokenHash).First(&magic).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 		return
 	}
@@ -254,18 +236,17 @@ func ConsumeMagicLink(c *gin.Context) {
 		return
 	}
 
-	if err := markMagicTokenUsed(ctx, magic.ID); err != nil {
-		logger.Error("Failed to mark magic token used: %v", err)
-	}
+	now := time.Now()
+	db.DB().Model(&magic).Update("used_at", now)
 
-	user, err := getUserByID(ctx, magic.UserID)
-	if err != nil || user.DisabledAt != nil {
+	var user models.User
+	if err := db.DB().First(&user, "id = ?", magic.UserID).Error; err != nil || user.DisabledAt != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 		return
 	}
 
 	if user.TwoFAEnabled && user.TwoFASecret != nil {
-		challengeToken, err := createTwoFAChallenge(ctx, user.ID)
+		challengeToken, err := createTwoFAChallenge(user.ID)
 		if err != nil {
 			logger.Error("Failed to create 2FA challenge: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -278,7 +259,7 @@ func ConsumeMagicLink(c *gin.Context) {
 		return
 	}
 
-	tokens, err := issueTokens(ctx, user.ID)
+	tokens, err := issueTokens(user.ID)
 	if err != nil {
 		logger.Error("Failed to issue tokens: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -288,71 +269,12 @@ func ConsumeMagicLink(c *gin.Context) {
 	c.JSON(http.StatusOK, tokens)
 }
 
-type User struct {
-	ID           string
-	Email        string
-	PasswordHash *string
-	Nome         string
-	Telefone     *string
-	CPF          *string
-	TwoFAEnabled bool
-	TwoFASecret  *string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	DisabledAt   *time.Time
-}
-
-type RefreshToken struct {
-	ID        string
-	UserID    string
-	TokenHash string
-	FamilyID  string
-	ExpiresAt time.Time
-	RevokedAt *time.Time
-	CreatedAt time.Time
-}
-
-type MagicToken struct {
-	ID        string
-	UserID    string
-	TokenHash string
-	ExpiresAt time.Time
-	UsedAt    *time.Time
-	CreatedAt time.Time
-}
-
-func getUserByEmail(ctx context.Context, email string) (*User, error) {
-	pool := db.Pool()
-	var u User
-	err := pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, nome, telefone, cpf, two_fa_enabled, two_fa_secret, created_at, updated_at, disabled_at
-		FROM users WHERE email = $1
-	`, email).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Nome, &u.Telefone, &u.CPF, &u.TwoFAEnabled, &u.TwoFASecret, &u.CreatedAt, &u.UpdatedAt, &u.DisabledAt)
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
-}
-
-func getUserByID(ctx context.Context, id string) (*User, error) {
-	pool := db.Pool()
-	var u User
-	err := pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, nome, telefone, cpf, two_fa_enabled, two_fa_secret, created_at, updated_at, disabled_at
-		FROM users WHERE id = $1
-	`, id).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Nome, &u.Telefone, &u.CPF, &u.TwoFAEnabled, &u.TwoFASecret, &u.CreatedAt, &u.UpdatedAt, &u.DisabledAt)
-	if err != nil {
-		return nil, err
-	}
-	return &u, nil
-}
-
-func issueTokens(ctx context.Context, userID string) (gin.H, error) {
+func issueTokens(userID string) (gin.H, error) {
 	familyID := uuid.New().String()
-	return issueTokensWithFamily(ctx, userID, familyID)
+	return issueTokensWithFamily(userID, familyID)
 }
 
-func issueTokensWithFamily(ctx context.Context, userID, familyID string) (gin.H, error) {
+func issueTokensWithFamily(userID, familyID string) (gin.H, error) {
 	cfg := config.Get()
 
 	jti := uuid.New().String()
@@ -372,131 +294,60 @@ func issueTokensWithFamily(ctx context.Context, userID, familyID string) (gin.H,
 		return nil, err
 	}
 
-	refreshToken := generateOpaqueToken()
-	refreshHash := hashToken(refreshToken)
-	expiresAt := now.Add(cfg.RefreshTokenTTL)
+	opaqueToken := models.GenerateOpaqueToken()
+	refreshToken := models.RefreshToken{
+		UserID:    userID,
+		TokenHash: models.HashToken(opaqueToken),
+		FamilyID:  familyID,
+		ExpiresAt: now.Add(cfg.RefreshTokenTTL),
+	}
 
-	pool := db.Pool()
-	_, err = pool.Exec(ctx, `
-		INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, uuid.New().String(), userID, refreshHash, familyID, expiresAt, now)
-	if err != nil {
+	if err := db.DB().Create(&refreshToken).Error; err != nil {
 		return nil, err
 	}
 
 	return gin.H{
 		"access_token":  accessToken,
-		"refresh_token": refreshToken,
+		"refresh_token": opaqueToken,
 		"token_type":    "Bearer",
 		"expires_in":    int(cfg.AccessTokenTTL.Seconds()),
 	}, nil
 }
 
-func getRefreshToken(ctx context.Context, tokenHash string) (*RefreshToken, error) {
-	pool := db.Pool()
-	var rt RefreshToken
-	err := pool.QueryRow(ctx, `
-		SELECT id, user_id, token_hash, family_id, expires_at, revoked_at, created_at
-		FROM refresh_tokens WHERE token_hash = $1
-	`, tokenHash).Scan(&rt.ID, &rt.UserID, &rt.TokenHash, &rt.FamilyID, &rt.ExpiresAt, &rt.RevokedAt, &rt.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &rt, nil
-}
-
-func revokeRefreshToken(ctx context.Context, id string) error {
-	pool := db.Pool()
-	_, err := pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, id)
-	return err
-}
-
-func revokeFamily(ctx context.Context, familyID string) error {
-	pool := db.Pool()
-	_, err := pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at = NOW() WHERE family_id = $1 AND revoked_at IS NULL`, familyID)
-	return err
-}
-
-func revokeAllUserRefreshTokens(ctx context.Context, userID string) error {
-	pool := db.Pool()
-	_, err := pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
-	return err
-}
-
-func createMagicToken(ctx context.Context, userID string) (string, error) {
+func createMagicToken(userID string) (string, error) {
 	cfg := config.Get()
-	pool := db.Pool()
 
-	_, err := pool.Exec(ctx, `UPDATE magic_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, userID)
-	if err != nil {
+	db.DB().Model(&models.MagicToken{}).
+		Where("user_id = ? AND used_at IS NULL", userID).
+		Update("used_at", time.Now())
+
+	opaqueToken := models.GenerateOpaqueToken()
+	magic := models.MagicToken{
+		UserID:    userID,
+		TokenHash: models.HashToken(opaqueToken),
+		ExpiresAt: time.Now().Add(cfg.MagicLinkTTL),
+	}
+
+	if err := db.DB().Create(&magic).Error; err != nil {
 		return "", err
 	}
 
-	token := generateOpaqueToken()
-	tokenHash := hashToken(token)
-	expiresAt := time.Now().Add(cfg.MagicLinkTTL)
+	return opaqueToken, nil
+}
 
-	_, err = pool.Exec(ctx, `
-		INSERT INTO magic_tokens (id, user_id, token_hash, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, NOW())
-	`, uuid.New().String(), userID, tokenHash, expiresAt)
-	if err != nil {
+func createTwoFAChallenge(userID string) (string, error) {
+	db.DB().Where("user_id = ?", userID).Delete(&models.TwoFAChallenge{})
+
+	opaqueToken := models.GenerateOpaqueToken()
+	challenge := models.TwoFAChallenge{
+		UserID:    userID,
+		TokenHash: models.HashToken(opaqueToken),
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+	}
+
+	if err := db.DB().Create(&challenge).Error; err != nil {
 		return "", err
 	}
 
-	return token, nil
-}
-
-func getMagicToken(ctx context.Context, tokenHash string) (*MagicToken, error) {
-	pool := db.Pool()
-	var mt MagicToken
-	err := pool.QueryRow(ctx, `
-		SELECT id, user_id, token_hash, expires_at, used_at, created_at
-		FROM magic_tokens WHERE token_hash = $1
-	`, tokenHash).Scan(&mt.ID, &mt.UserID, &mt.TokenHash, &mt.ExpiresAt, &mt.UsedAt, &mt.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &mt, nil
-}
-
-func markMagicTokenUsed(ctx context.Context, id string) error {
-	pool := db.Pool()
-	_, err := pool.Exec(ctx, `UPDATE magic_tokens SET used_at = NOW() WHERE id = $1`, id)
-	return err
-}
-
-func createTwoFAChallenge(ctx context.Context, userID string) (string, error) {
-	pool := db.Pool()
-
-	_, err := pool.Exec(ctx, `DELETE FROM two_fa_challenges WHERE user_id = $1`, userID)
-	if err != nil {
-		return "", err
-	}
-
-	token := generateOpaqueToken()
-	tokenHash := hashToken(token)
-	expiresAt := time.Now().Add(5 * time.Minute)
-
-	_, err = pool.Exec(ctx, `
-		INSERT INTO two_fa_challenges (id, user_id, token_hash, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, NOW())
-	`, uuid.New().String(), userID, tokenHash, expiresAt)
-	if err != nil {
-		return "", err
-	}
-
-	return token, nil
-}
-
-func generateOpaqueToken() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func hashToken(token string) string {
-	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:])
+	return opaqueToken, nil
 }

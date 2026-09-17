@@ -1,18 +1,15 @@
 package password
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/newsand/base-login/internal/config"
 	"github.com/newsand/base-login/internal/db"
 	"github.com/newsand/base-login/internal/logger"
 	"github.com/newsand/base-login/internal/middleware"
+	"github.com/newsand/base-login/internal/models"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -41,44 +38,38 @@ func Forgot(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
 	cfg := config.Get()
-	pool := db.Pool()
 
-	var userID string
-	var disabledAt *time.Time
-	err := pool.QueryRow(ctx, `SELECT id, disabled_at FROM users WHERE email = $1`, req.Email).Scan(&userID, &disabledAt)
-	if err != nil {
+	var user models.User
+	if err := db.DB().Where("email = ?", req.Email).First(&user).Error; err != nil {
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a recovery link will be sent"})
 		return
 	}
 
-	if disabledAt != nil {
+	if user.DisabledAt != nil {
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a recovery link will be sent"})
 		return
 	}
 
-	_, err = pool.Exec(ctx, `UPDATE recover_tokens SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL`, userID)
-	if err != nil {
-		logger.Error("Failed to invalidate old recovery tokens: %v", err)
+	db.DB().Model(&models.RecoverToken{}).
+		Where("user_id = ? AND used_at IS NULL", user.ID).
+		Update("used_at", time.Now())
+
+	opaqueToken := models.GenerateOpaqueToken()
+	recoverToken := models.RecoverToken{
+		UserID:    user.ID,
+		TokenHash: models.HashToken(opaqueToken),
+		ExpiresAt: time.Now().Add(cfg.RecoverTTL),
 	}
 
-	token := generateOpaqueToken()
-	tokenHash := hashToken(token)
-	expiresAt := time.Now().Add(cfg.RecoverTTL)
-
-	_, err = pool.Exec(ctx, `
-		INSERT INTO recover_tokens (id, user_id, token_hash, expires_at, created_at)
-		VALUES ($1, $2, $3, $4, NOW())
-	`, uuid.New().String(), userID, tokenHash, expiresAt)
-	if err != nil {
+	if err := db.DB().Create(&recoverToken).Error; err != nil {
 		logger.Error("Failed to create recovery token: %v", err)
 		c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a recovery link will be sent"})
 		return
 	}
 
 	if cfg.MailerStub {
-		logger.Info("[MAILER STUB] Recovery token for %s: %s", req.Email, token)
+		logger.Info("[MAILER STUB] Recovery token for %s: %s", req.Email, opaqueToken)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "if the email exists, a recovery link will be sent"})
@@ -91,22 +82,15 @@ func Reset(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	tokenHash := hashToken(req.Token)
-	pool := db.Pool()
+	tokenHash := models.HashToken(req.Token)
 
-	var tokenID, userID string
-	var expiresAt time.Time
-	var usedAt *time.Time
-	err := pool.QueryRow(ctx, `
-		SELECT id, user_id, expires_at, used_at FROM recover_tokens WHERE token_hash = $1
-	`, tokenHash).Scan(&tokenID, &userID, &expiresAt, &usedAt)
-	if err != nil {
+	var recoverToken models.RecoverToken
+	if err := db.DB().Where("token_hash = ?", tokenHash).First(&recoverToken).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 		return
 	}
 
-	if usedAt != nil || time.Now().After(expiresAt) {
+	if recoverToken.UsedAt != nil || time.Now().After(recoverToken.ExpiresAt) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 		return
 	}
@@ -118,34 +102,15 @@ func Reset(c *gin.Context) {
 		return
 	}
 
-	_, err = pool.Exec(ctx, `UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, string(hash), userID)
-	if err != nil {
-		logger.Error("Failed to update password: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
+	passwordHash := string(hash)
+	db.DB().Model(&models.User{}).Where("id = ?", recoverToken.UserID).Update("password_hash", passwordHash)
 
-	_, err = pool.Exec(ctx, `UPDATE recover_tokens SET used_at = NOW() WHERE id = $1`, tokenID)
-	if err != nil {
-		logger.Error("Failed to mark recovery token used: %v", err)
-	}
+	db.DB().Model(&recoverToken).Update("used_at", time.Now())
 
-	_, err = pool.Exec(ctx, `UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, userID)
-	if err != nil {
-		logger.Error("Failed to revoke refresh tokens: %v", err)
-	}
+	db.DB().Model(&models.RefreshToken{}).
+		Where("user_id = ? AND revoked_at IS NULL", recoverToken.UserID).
+		Update("revoked_at", time.Now())
 
-	logger.Info("Password reset completed for user: %s", userID)
+	logger.Info("Password reset completed for user: %s", recoverToken.UserID)
 	c.JSON(http.StatusOK, gin.H{"message": "password reset successful"})
-}
-
-func generateOpaqueToken() string {
-	b := make([]byte, 32)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func hashToken(token string) string {
-	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:])
 }

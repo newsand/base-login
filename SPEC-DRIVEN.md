@@ -22,6 +22,7 @@ Ver `AUTH-MVP.md` §1. Resumo: login, refresh (rotação+reuse), logout, recover
 - Um `main.go` fino: carrega config, inicia singletons, registra rotas, sobe HTTP.
 - **Logger singleton** — sem lib de log; `fmt`/`print` colorido no stdio; `LOG_LEVEL` env; `gin.ForceConsoleColor()`.
 - **DBManager singleton** — Postgres; padrão Gin de config/DB; pool único.
+- **GORM Active Record; no ORM/DB swap abstractions.**
 - Rotas com **Router groups** do Gin (`/v1/auth`, `/v1/users`, …).
 - Complexidade sobe só quando uma feature exige.
 
@@ -29,6 +30,7 @@ Ver `AUTH-MVP.md` §1. Resumo: login, refresh (rotação+reuse), logout, recover
 
 - Go **≥ 1.25** (versão mais recente estável disponível no build)
 - Gin
+- GORM (Postgres driver)
 - Postgres
 - Deploy: **Nixpacks** (homolog/prod)
 - Local/test: **docker compose** = app + Postgres

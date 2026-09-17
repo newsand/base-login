@@ -2,6 +2,8 @@
 
 JWT authentication service for identity verification. No roles, no redirect — issues JWTs to prove who users are.
 
+**Data access:** GORM Active Record; no ORM/DB swap abstractions.
+
 ## Quick Start (Docker Compose)
 
 ```bash
@@ -198,7 +200,9 @@ psql $DATABASE_URL -f migrations/001_initial.sql
 
 ## Database
 
-Postgres required. Run migrations before first start:
+Postgres required. SQL migrations used (GORM models match the schema).
+
+Run migrations before first start:
 
 ```bash
 psql $DATABASE_URL -f migrations/001_initial.sql

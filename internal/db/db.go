@@ -1,35 +1,38 @@
 package db
 
 import (
-	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/newsand/base-login/internal/logger"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
 
-var pool *pgxpool.Pool
+var gormDB *gorm.DB
 
 func Init(databaseURL string) error {
-	config, err := pgxpool.ParseConfig(databaseURL)
+	config := &gorm.Config{
+		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
+	}
+
+	var err error
+	gormDB, err = gorm.Open(postgres.Open(databaseURL), config)
 	if err != nil {
 		return err
 	}
 
-	config.MaxConns = 25
-	config.MinConns = 5
-	config.MaxConnLifetime = time.Hour
-	config.MaxConnIdleTime = 30 * time.Minute
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	pool, err = pgxpool.NewWithConfig(ctx, config)
+	sqlDB, err := gormDB.DB()
 	if err != nil {
 		return err
 	}
 
-	if err := pool.Ping(ctx); err != nil {
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(time.Hour)
+	sqlDB.SetConnMaxIdleTime(30 * time.Minute)
+
+	if err := sqlDB.Ping(); err != nil {
 		return err
 	}
 
@@ -37,17 +40,24 @@ func Init(databaseURL string) error {
 	return nil
 }
 
-func Pool() *pgxpool.Pool {
-	return pool
+func DB() *gorm.DB {
+	return gormDB
 }
 
 func Close() {
-	if pool != nil {
-		pool.Close()
+	if gormDB != nil {
+		sqlDB, _ := gormDB.DB()
+		if sqlDB != nil {
+			sqlDB.Close()
+		}
 		logger.Info("Database connection closed")
 	}
 }
 
-func HealthCheck(ctx context.Context) error {
-	return pool.Ping(ctx)
+func HealthCheck() error {
+	sqlDB, err := gormDB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Ping()
 }
