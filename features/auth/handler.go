@@ -142,8 +142,27 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
-	now := time.Now()
-	db.DB().Model(&refresh).Update("revoked_at", now)
+	var user models.User
+	if err := db.DB().First(&user, "id = ?", refresh.UserID).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
+		return
+	}
+	if user.DisabledAt != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account disabled"})
+		return
+	}
+
+	result := db.DB().Model(&models.RefreshToken{}).
+		Where("id = ? AND revoked_at IS NULL", refresh.ID).
+		Update("revoked_at", time.Now())
+	if result.RowsAffected == 0 {
+		logger.Warn("Reuse detection (TOCTOU): revoking family %s", refresh.FamilyID)
+		db.DB().Model(&models.RefreshToken{}).
+			Where("family_id = ? AND revoked_at IS NULL", refresh.FamilyID).
+			Update("revoked_at", time.Now())
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid refresh token"})
+		return
+	}
 
 	tokens, err := issueTokensWithFamily(refresh.UserID, refresh.FamilyID)
 	if err != nil {

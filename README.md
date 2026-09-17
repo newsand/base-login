@@ -213,11 +213,11 @@ Tables: `users`, `refresh_tokens`, `invites`, `magic_tokens`, `recover_tokens`, 
 ## Security Notes
 
 - **JWT Secret**: Use 32+ character random string in production
-- **Service Keys**: Rotate keys by adding new key, updating consumers, then removing old key
-- **Refresh Tokens**: Stored as SHA-256 hashes. Rotation on each use. Reuse detection revokes entire family
-- **Passwords**: bcrypt with default cost
-- **Rate Limiting**: Built-in per-endpoint. Configure via `RATE_LIMIT_*` vars
-- **Account Lockout**: After failed attempts. Configure via `LOCKOUT_*` vars
+- **Service Keys**: Rotate keys by adding new key, updating consumers, then removing old key. Constant-time comparison used.
+- **Refresh Tokens**: Stored as SHA-256 hashes. Rotation on each use. Reuse detection revokes entire family (atomic check prevents TOCTOU).
+- **Passwords**: bcrypt cost 12
+- **Rate Limiting**: In-memory per-endpoint. Configure via `RATE_LIMIT_*` vars. **Note:** In-memory counters do not sync across replicas. For multi-replica deployments, implement Redis/DB-backed rate limiting or use an API gateway.
+- **Account Lockout**: In-memory per-account/IP. Configure via `LOCKOUT_*` vars. Same multi-replica caveat as rate limiting.
 
 ## Specs
 

@@ -13,6 +13,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const BcryptCost = 12
+
 func RegisterRoutes(r *gin.RouterGroup) {
 	pwd := r.Group("/password")
 	pwd.Use(middleware.RateLimit())
@@ -95,7 +97,7 @@ func Reset(c *gin.Context) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), BcryptCost)
 	if err != nil {
 		logger.Error("Failed to hash password: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})

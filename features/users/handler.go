@@ -13,6 +13,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const BcryptCost = 12
+
 func RegisterRoutes(r *gin.RouterGroup) {
 	users := r.Group("/users")
 	users.Use(middleware.ServiceKeyAuth())
@@ -81,7 +83,7 @@ func CreateUser(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "password must be at least 8 characters"})
 			return
 		}
-		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), bcrypt.DefaultCost)
+		hash, err := bcrypt.GenerateFromPassword([]byte(*req.Password), BcryptCost)
 		if err != nil {
 			logger.Error("Failed to hash password: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -188,11 +190,13 @@ func UpdateUser(c *gin.Context) {
 	if req.CPF != nil {
 		updates["cpf"] = *req.CPF
 	}
+	disabling := false
 	if req.DisabledAt != nil {
 		if *req.DisabledAt == "" {
 			updates["disabled_at"] = nil
 		} else {
 			updates["disabled_at"] = time.Now()
+			disabling = true
 		}
 	}
 
@@ -202,6 +206,13 @@ func UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 			return
 		}
+	}
+
+	if disabling {
+		db.DB().Model(&models.RefreshToken{}).
+			Where("user_id = ? AND revoked_at IS NULL", id).
+			Update("revoked_at", time.Now())
+		logger.Info("Revoked all refresh tokens for disabled user: %s", id)
 	}
 
 	logger.Info("User updated: %s", id)
@@ -265,7 +276,15 @@ func AcceptInvite(c *gin.Context) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	var existingUser models.User
+	userExists := db.DB().Where("email = ?", invite.Email).First(&existingUser).Error == nil
+
+	if userExists && existingUser.PasswordHash != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "account already exists"})
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), BcryptCost)
 	if err != nil {
 		logger.Error("Failed to hash password: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -277,16 +296,14 @@ func AcceptInvite(c *gin.Context) {
 		nome = invite.Email
 	}
 
-	var existingUser models.User
 	var userID string
 	passwordHash := string(hash)
 
-	if err := db.DB().Where("email = ?", invite.Email).First(&existingUser).Error; err == nil {
+	if userExists {
 		userID = existingUser.ID
 		db.DB().Model(&existingUser).Updates(map[string]interface{}{
 			"password_hash": passwordHash,
 			"nome":          nome,
-			"disabled_at":   nil,
 		})
 	} else {
 		newUser := models.User{

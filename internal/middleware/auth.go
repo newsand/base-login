@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -75,9 +77,11 @@ func ServiceKeyAuth() gin.HandlerFunc {
 		key := parts[1]
 		cfg := config.Get()
 
+		keyHash := sha256.Sum256([]byte(key))
 		valid := false
 		for _, sk := range cfg.ServiceKeys {
-			if sk == key {
+			skHash := sha256.Sum256([]byte(sk))
+			if subtle.ConstantTimeCompare(keyHash[:], skHash[:]) == 1 {
 				valid = true
 				logger.Debug("Service key authenticated")
 				break

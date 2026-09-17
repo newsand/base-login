@@ -44,6 +44,10 @@ func DB() *gorm.DB {
 	return gormDB
 }
 
+func SetTestDB(testDB *gorm.DB) {
+	gormDB = testDB
+}
+
 func Close() {
 	if gormDB != nil {
 		sqlDB, _ := gormDB.DB()
