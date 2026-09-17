@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/newsand/base-login/features/auth"
 	"github.com/newsand/base-login/internal/config"
 	"github.com/newsand/base-login/internal/db"
 	"github.com/newsand/base-login/internal/models"
@@ -27,6 +28,8 @@ func setupTestDB(t *testing.T) {
 		&models.User{},
 		&models.RefreshToken{},
 		&models.Invite{},
+		&models.MagicToken{},
+		&models.TwoFAChallenge{},
 	)
 	if err != nil {
 		t.Fatalf("failed to migrate test database: %v", err)
@@ -40,6 +43,15 @@ func setupTestRouter() *gin.Engine {
 	r := gin.New()
 	v1 := r.Group("/v1")
 	RegisterRoutes(v1)
+	return r
+}
+
+func setupTestRouterWithAuth() *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/v1")
+	RegisterRoutes(v1)
+	auth.RegisterRoutes(v1)
 	return r
 }
 
@@ -173,7 +185,10 @@ func TestAcceptInviteCreatesNewUser(t *testing.T) {
 
 func TestDisableUserRevokesRefreshTokens(t *testing.T) {
 	setupTestDB(t)
-	config.Load()
+	cfg := config.Load()
+	cfg.ServiceKeys = []string{"test-service-key"}
+
+	router := setupTestRouter()
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.MinCost)
 	passwordHash := string(hash)
@@ -184,9 +199,10 @@ func TestDisableUserRevokesRefreshTokens(t *testing.T) {
 	}
 	db.DB().Create(user)
 
+	opaqueToken := "test-refresh-token-abc123"
 	refreshToken := &models.RefreshToken{
 		UserID:    user.ID,
-		TokenHash: models.HashToken("refresh-token-1"),
+		TokenHash: models.HashToken(opaqueToken),
 		FamilyID:  "family-1",
 		ExpiresAt: time.Now().Add(24 * time.Hour),
 	}
@@ -198,15 +214,79 @@ func TestDisableUserRevokesRefreshTokens(t *testing.T) {
 		t.Fatalf("expected 1 active token before disable, got %d", activeBefore)
 	}
 
-	now := time.Now()
-	db.DB().Model(user).Update("disabled_at", now)
-	db.DB().Model(&models.RefreshToken{}).
-		Where("user_id = ? AND revoked_at IS NULL", user.ID).
-		Update("revoked_at", now)
+	patchBody, _ := json.Marshal(map[string]string{
+		"disabled_at": "now",
+	})
+	req := httptest.NewRequest("PATCH", "/v1/users/"+user.ID, bytes.NewBuffer(patchBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-service-key")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH disable failed: %d %s", w.Code, w.Body.String())
+	}
 
 	var activeAfter int64
 	db.DB().Model(&models.RefreshToken{}).Where("user_id = ? AND revoked_at IS NULL", user.ID).Count(&activeAfter)
 	if activeAfter != 0 {
-		t.Errorf("expected 0 active tokens after disable, got %d", activeAfter)
+		t.Errorf("expected 0 active tokens after disable via PATCH, got %d", activeAfter)
+	}
+
+	var revokedToken models.RefreshToken
+	db.DB().Where("token_hash = ?", models.HashToken(opaqueToken)).First(&revokedToken)
+	if revokedToken.RevokedAt == nil {
+		t.Error("refresh token should be revoked after PATCH disable")
+	}
+}
+
+func TestDisableUserRefreshRejected(t *testing.T) {
+	setupTestDB(t)
+	cfg := config.Load()
+	cfg.ServiceKeys = []string{"test-service-key"}
+
+	router := setupTestRouterWithAuth()
+
+	hash, _ := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.MinCost)
+	passwordHash := string(hash)
+	user := &models.User{
+		Email:        "disable-refresh@example.com",
+		PasswordHash: &passwordHash,
+		Nome:         "Disable Refresh Test",
+	}
+	db.DB().Create(user)
+
+	opaqueToken := "refresh-to-be-rejected"
+	refreshToken := &models.RefreshToken{
+		UserID:    user.ID,
+		TokenHash: models.HashToken(opaqueToken),
+		FamilyID:  "family-reject",
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	db.DB().Create(refreshToken)
+
+	patchBody, _ := json.Marshal(map[string]string{
+		"disabled_at": "now",
+	})
+	req := httptest.NewRequest("PATCH", "/v1/users/"+user.ID, bytes.NewBuffer(patchBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-service-key")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH disable failed: %d %s", w.Code, w.Body.String())
+	}
+
+	refreshBody, _ := json.Marshal(map[string]string{
+		"refresh_token": opaqueToken,
+	})
+	req = httptest.NewRequest("POST", "/v1/auth/refresh", bytes.NewBuffer(refreshBody))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("refresh after disable should return 401, got %d: %s", w.Code, w.Body.String())
 	}
 }

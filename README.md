@@ -218,6 +218,7 @@ Tables: `users`, `refresh_tokens`, `invites`, `magic_tokens`, `recover_tokens`, 
 - **Passwords**: bcrypt cost 12
 - **Rate Limiting**: In-memory per-endpoint. Configure via `RATE_LIMIT_*` vars. **Note:** In-memory counters do not sync across replicas. For multi-replica deployments, implement Redis/DB-backed rate limiting or use an API gateway.
 - **Account Lockout**: In-memory per-account/IP. Configure via `LOCKOUT_*` vars. Same multi-replica caveat as rate limiting.
+- **Soft-disable**: When a user is disabled via `PATCH /users/:id`, all refresh tokens are revoked immediately. However, existing **access JWTs remain valid until their TTL** (~15 min). Middleware does not re-check `disabled_at` on every request in this MVP.
 
 ## Specs
 
