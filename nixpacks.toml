@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["go"]
+
+[phases.build]
+cmds = ["go build -ldflags='-w -s' -o server ."]
+
+[start]
+cmd = "./server"
+
+[variables]
+CGO_ENABLED = "0"
