@@ -155,6 +155,16 @@ curl -X POST http://localhost:8080/v1/invites \
   -d '{"email":"newuser@example.com"}'
 ```
 
+Response (`MAILER_STUB=true`, the default in dev/docker-compose):
+```json
+{"message":"invite sent","email":"newuser@example.com","token":"a1b2c3...","expires_at":"2026-09-24T16:17:21Z"}
+```
+
+`token` and `expires_at` are only present when `MAILER_STUB=true` — the mailer isn't real, so
+the caller needs the raw token back to deliver it itself (e.g. build a magic-link URL). With a
+real mailer configured (`MAILER_STUB=false`), the token stays out-of-band and the response is
+just `{"message":"invite sent","email":"..."}`. Never rely on the `token` field in production.
+
 ### Accept Invite
 
 ```bash

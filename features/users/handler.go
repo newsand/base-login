@@ -245,15 +245,22 @@ func CreateInvite(c *gin.Context) {
 		return
 	}
 
+	response := gin.H{
+		"message": "invite sent",
+		"email":   req.Email,
+	}
+
 	if cfg.MailerStub {
 		logger.Info("[MAILER STUB] Invite for %s: %s", req.Email, opaqueToken)
+		// Mailer is stubbed (no real OOB delivery), so the caller needs the
+		// token back to be able to hand it to the invitee itself. Never
+		// returned when a real mailer is configured — token stays OOB then.
+		response["token"] = opaqueToken
+		response["expires_at"] = invite.ExpiresAt
 	}
 
 	logger.Info("Invite created for: %s", req.Email)
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "invite sent",
-		"email":   req.Email,
-	})
+	c.JSON(http.StatusCreated, response)
 }
 
 func AcceptInvite(c *gin.Context) {

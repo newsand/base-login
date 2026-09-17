@@ -56,3 +56,19 @@ Ver `AUTH-MVP.md` §1. Resumo: login, refresh (rotação+reuse), logout, recover
 - Login/refresh/logout/recover/magic/invite/CRUD(service key) batem com `AUTH-MVP.md`
 - Sem pastas/camadas proibidas; features only
 - Moriaty ataca o código contra `AUTH-MVP.md`
+
+## 8. Decisões pós-MVP (registradas aqui para não parecer spec drift)
+
+- **`POST /v1/invites` devolve o token no corpo quando `MAILER_STUB=true`** (`token` +
+  `expires_at`, além de `message`/`email`). O invite continua sendo entregue OOB por
+  contrato (§7 do `AUTH-MVP.md`); a diferença é só que, sem mailer real configurado, o
+  serviço precisa devolver o valor pra quem chamou poder entregá-lo de outro jeito (ex.:
+  montar o link do magic-link). Com `MAILER_STUB=false` o campo `token` não existe na
+  resposta — o token volta a ser estritamente OOB, hash-only no DB como sempre foi.
+
+## 9. Integração por produtos consumidores
+
+Todo produto que usa este serviço para identidade (roles/dados ficam no produto, nunca
+aqui) deve seguir o guia em `../doc-integracao/`, que documenta o padrão de integração
+usado pelo `crazy-back`/`crazy-front` (JWT com segredo compartilhado, service key só no
+backend do produto, fluxo de invite/magic-link ponta a ponta).
