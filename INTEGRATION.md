@@ -1,5 +1,7 @@
 # Guia de Integração — LoginBuskar
 
+> **Versão:** 1.1 (2026-09-18) — Corrigido: distinção auth vs product 401, race multi-tab, logout server-side.
+
 Guia para clientes (front-ends, BFFs, apps mobile) consumirem o serviço de autenticação.
 
 **Escopo do serviço:** identidade via JWT. O LoginBuskar **não** gerencia roles, permissões ou RBAC — isso é responsabilidade do sistema que consome o JWT (Buskar, Vistoria, etc.).
@@ -65,11 +67,26 @@ Se não há BFF, armazene:
 - `access_token` em memória (variável JavaScript)
 - `refresh_token` em `localStorage` (persistência entre refreshes de página)
 
-**⚠️ Risco:** `localStorage` é acessível via XSS. Se seu app tiver vulnerabilidade XSS, o atacante pode exfiltrar o refresh token. Mitigue com CSP rigoroso e sanitização de inputs.
+**⚠️ Riscos:**
+- `localStorage` é acessível via XSS. Se seu app tiver vulnerabilidade XSS, o atacante pode exfiltrar o refresh token. Mitigue com CSP rigoroso e sanitização de inputs.
+- Múltiplas tabs podem causar race condition no refresh. Veja [coordenação multi-tab](#-warning-race-condition-multi-tab).
 
 ```javascript
-// Exemplo simplificado
+// Exemplo simplificado — para produção, veja implementação completa na seção Refresh
 let accessToken = null;
+
+// BroadcastChannel para sincronizar tokens entre tabs
+const tokenChannel = new BroadcastChannel('auth_tokens');
+tokenChannel.onmessage = (event) => {
+  if (event.data.type === 'TOKENS_UPDATED') {
+    accessToken = event.data.accessToken;
+    localStorage.setItem('refresh_token', event.data.refreshToken);
+  } else if (event.data.type === 'LOGGED_OUT') {
+    accessToken = null;
+    localStorage.removeItem('refresh_token');
+    window.location.href = '/login';
+  }
+};
 
 function storeTokens(tokens) {
   accessToken = tokens.access_token;
@@ -170,39 +187,149 @@ HTTP/1.1 200 OK
 
 O refresh token renova o access token antes/após expiração. **Crítico:** implemente proteção contra loop infinito de refresh.
 
+### Distinção: Auth 401 vs Product 401
+
+**Nem todo 401 significa "access expirou".** Você deve distinguir:
+
+| Origem do 401 | Causa | Ação Correta |
+|---------------|-------|--------------|
+| **Auth layer** (LoginBuskar / JWT middleware) | Access JWT expirado, inválido, ou ausente | Tenta refresh **uma vez** |
+| **Product API** (Buskar, Vistoria, etc.) | Permissão negada, tenant errado, recurso não autorizado | **NÃO** faz refresh — exibe erro ao usuário |
+
+**Como identificar um auth 401:**
+
+O LoginBuskar retorna erros conhecidos no body. Faça refresh **apenas** quando o erro for um destes:
+
+- `{"error": "invalid token"}`
+- `{"error": "missing authorization header"}`
+- `{"error": "invalid authorization header"}`
+
+Qualquer outro 401 (ex: `{"error": "forbidden"}`, `{"error": "not authorized"}`, ou estrutura diferente de produto) **não** deve disparar refresh — é falha de autorização do produto, não expiração de JWT.
+
 ### Algoritmo Obrigatório
 
 ```
-QUANDO receber 401 em qualquer requisição protegida:
-  SE já estou fazendo refresh (flag isRefreshing = true):
-    → NÃO tente refresh novamente
-    → Falhe a requisição original
-  
-  SE refresh já falhou nesta sessão (flag refreshFailed = true):
-    → logout() → limpa tokens → redireciona para login
-    → NÃO tente refresh
-  
-  SENÃO:
-    → isRefreshing = true
-    → tenta POST /v1/auth/refresh
-    
-    SE refresh sucesso:
-      → armazena novos tokens
-      → isRefreshing = false
-      → retry da requisição original (UMA vez só)
-    
-    SE refresh falha (401):
-      → refreshFailed = true
-      → isRefreshing = false
-      → logout() → limpa tokens → redireciona para login
+QUANDO receber 401:
+  1. VERIFICA se é auth 401:
+     - Parse response body
+     - SE error ∈ {"invalid token", "missing authorization header", 
+                   "invalid authorization header"}:
+       → É auth 401
+     - SENÃO:
+       → É product 401 → NÃO faz refresh → exibe erro → PARA
+
+  2. SE é auth 401:
+     SE já estou fazendo refresh (flag isRefreshing = true):
+       → NÃO tente refresh novamente
+       → Espera na fila ou falha
+     
+     SE refresh já falhou nesta sessão (flag refreshFailed = true):
+       → logout() → POST /v1/auth/logout + limpa tokens → redireciona
+       → NÃO tente refresh
+     
+     SENÃO:
+       → isRefreshing = true
+       → tenta POST /v1/auth/refresh
+       
+       SE refresh sucesso:
+         → armazena novos tokens (broadcast para outras tabs)
+         → isRefreshing = false
+         → retry da requisição original (UMA vez só)
+       
+       SE refresh falha (401):
+         → refreshFailed = true
+         → isRefreshing = false
+         → logout() → POST /v1/auth/logout + limpa tokens → redireciona
 ```
+
+### ⚠️ WARNING: Race Condition Multi-Tab
+
+**Problema:** A flag `isRefreshing` existe apenas na memória de uma tab. Se o usuário tem duas tabs abertas e ambas recebem 401 simultaneamente:
+
+1. Tab A: `isRefreshing = true`, envia refresh token `R1`
+2. Tab B: `isRefreshing = true` (sua própria flag), envia **o mesmo** refresh token `R1`
+3. Servidor: Tab A consome `R1`, emite `R2`. Tab B apresenta `R1` já usado → **reuse detection** → revoga toda a família → **usuário deslogado em todas as tabs**.
+
+**Solução obrigatória:** Coordene refresh entre tabs usando `BroadcastChannel` + `navigator.locks` (ou leader-election).
 
 ### Implementação de Referência (JavaScript/TypeScript)
 
 ```javascript
-let isRefreshing = false;
+// ============================================================
+// CONFIGURAÇÃO
+// ============================================================
+const AUTH_BASE_URL = 'https://auth.example.com';
+const AUTH_ERRORS = new Set([
+  'invalid token',
+  'missing authorization header',
+  'invalid authorization header',
+]);
+
+// ============================================================
+// ESTADO (per-tab, mas refresh é coordenado via locks)
+// ============================================================
+let accessToken = null;
 let refreshFailed = false;
 let pendingRequests = [];
+
+// Canal para sincronizar tokens entre tabs
+const tokenChannel = new BroadcastChannel('auth_tokens');
+tokenChannel.onmessage = (event) => {
+  if (event.data.type === 'TOKENS_UPDATED') {
+    accessToken = event.data.accessToken;
+    localStorage.setItem('refresh_token', event.data.refreshToken);
+  } else if (event.data.type === 'LOGGED_OUT') {
+    accessToken = null;
+    localStorage.removeItem('refresh_token');
+    window.location.href = '/login';
+  }
+};
+
+// ============================================================
+// FUNÇÕES PRINCIPAIS
+// ============================================================
+
+function storeTokens(tokens) {
+  accessToken = tokens.access_token;
+  localStorage.setItem('refresh_token', tokens.refresh_token);
+}
+
+function clearTokens() {
+  accessToken = null;
+  localStorage.removeItem('refresh_token');
+}
+
+function broadcastTokens(tokens) {
+  tokenChannel.postMessage({
+    type: 'TOKENS_UPDATED',
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+  });
+}
+
+function broadcastLogout() {
+  tokenChannel.postMessage({ type: 'LOGGED_OUT' });
+}
+
+// ============================================================
+// VERIFICAÇÃO DE AUTH 401
+// ============================================================
+
+async function isAuthError(response) {
+  if (response.status !== 401) return false;
+  
+  try {
+    const cloned = response.clone();
+    const body = await cloned.json();
+    return AUTH_ERRORS.has(body.error);
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================
+// FETCH COM AUTH
+// ============================================================
 
 async function fetchWithAuth(url, options = {}) {
   const response = await fetch(url, {
@@ -213,79 +340,129 @@ async function fetchWithAuth(url, options = {}) {
     },
   });
 
-  if (response.status === 401 && !options._isRetry) {
-    return handleUnauthorized(url, options);
+  // Só tenta refresh se for auth 401 E não for retry
+  if (response.status === 401 && !options._isRetry && await isAuthError(response)) {
+    return handleAuthUnauthorized(url, options);
   }
 
   return response;
 }
 
-async function handleUnauthorized(url, options) {
-  // Já falhou refresh nesta sessão? Logout.
+// ============================================================
+// HANDLER DE AUTH 401 (com coordenação multi-tab)
+// ============================================================
+
+async function handleAuthUnauthorized(url, options) {
   if (refreshFailed) {
-    logout();
+    await logout();
     throw new Error('Session expired');
   }
 
-  // Já está fazendo refresh? Espera na fila.
-  if (isRefreshing) {
-    return new Promise((resolve, reject) => {
-      pendingRequests.push({ resolve, reject, url, options });
-    });
-  }
-
-  isRefreshing = true;
-
   try {
-    const newTokens = await refreshTokens();
+    // navigator.locks garante que apenas UMA tab (ou request) faz refresh
+    const newTokens = await navigator.locks.request(
+      'auth_refresh_lock',
+      { mode: 'exclusive' },
+      async () => {
+        // Verifica se outra tab já fez refresh enquanto esperávamos o lock
+        const currentRefresh = localStorage.getItem('refresh_token');
+        if (!currentRefresh) {
+          throw new Error('No refresh token');
+        }
+
+        const response = await fetch(`${AUTH_BASE_URL}/v1/auth/refresh`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: currentRefresh }),
+        });
+
+        if (!response.ok) {
+          throw new Error('Refresh failed');
+        }
+
+        return response.json();
+      }
+    );
+
+    // Atualiza tokens localmente e notifica outras tabs
     storeTokens(newTokens);
-    isRefreshing = false;
+    broadcastTokens(newTokens);
 
-    // Processa fila de requisições pendentes
-    pendingRequests.forEach(({ resolve, url, options }) => {
-      resolve(fetchWithAuth(url, { ...options, _isRetry: true }));
-    });
-    pendingRequests = [];
-
-    // Retry da requisição original
+    // Retry da requisição original (UMA vez só)
     return fetchWithAuth(url, { ...options, _isRetry: true });
 
   } catch (error) {
-    isRefreshing = false;
     refreshFailed = true;
-
-    // Rejeita todas as pendentes
-    pendingRequests.forEach(({ reject }) => reject(error));
-    pendingRequests = [];
-
-    logout();
+    await logout();
     throw error;
   }
 }
 
-async function refreshTokens() {
-  const refreshToken = localStorage.getItem('refresh_token');
-  if (!refreshToken) {
-    throw new Error('No refresh token');
+// ============================================================
+// LOGOUT (DEVE CHAMAR A API)
+// ============================================================
+
+async function logout() {
+  // Best-effort: tenta revogar refresh no servidor
+  // Se access já expirou, a chamada falhará, mas prosseguimos
+  if (accessToken) {
+    try {
+      await fetch(`${AUTH_BASE_URL}/v1/auth/logout`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
+    } catch {
+      // Ignora erro — refresh pode ficar ativo até TTL/reuse,
+      // mas não podemos fazer mais nada sem access válido
+    }
   }
 
-  const response = await fetch('https://auth.example.com/v1/auth/refresh', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: refreshToken }),
-  });
-
-  if (!response.ok) {
-    throw new Error('Refresh failed');
-  }
-
-  return response.json();
-}
-
-function logout() {
   clearTokens();
+  broadcastLogout();
   refreshFailed = false;
   window.location.href = '/login';
+}
+```
+
+### Fallback sem navigator.locks
+
+Se precisar suportar browsers antigos (Safari < 16.4), use leader-election via localStorage:
+
+```javascript
+async function refreshWithLeaderElection() {
+  const lockKey = 'auth_refresh_lock';
+  const lockValue = `${Date.now()}-${Math.random()}`;
+  
+  // Tenta adquirir lock
+  const existing = localStorage.getItem(lockKey);
+  if (existing) {
+    const [timestamp] = existing.split('-');
+    // Lock expirado (> 10s)?
+    if (Date.now() - parseInt(timestamp) < 10000) {
+      // Outra tab está fazendo refresh — espera e usa o resultado
+      await new Promise(r => setTimeout(r, 1000));
+      return; // Tokens já atualizados via BroadcastChannel
+    }
+  }
+  
+  localStorage.setItem(lockKey, lockValue);
+  
+  try {
+    // Double-check após set
+    if (localStorage.getItem(lockKey) !== lockValue) {
+      return; // Perdeu a corrida
+    }
+    
+    // Faz o refresh...
+    const tokens = await doRefresh();
+    storeTokens(tokens);
+    broadcastTokens(tokens);
+    
+  } finally {
+    if (localStorage.getItem(lockKey) === lockValue) {
+      localStorage.removeItem(lockKey);
+    }
+  }
 }
 ```
 
@@ -773,6 +950,21 @@ const response = await fetch('/v1/users', {
 
 **Correção:** Mova chamadas CRUD para seu backend.
 
+### ❌ Refresh em Qualquer 401
+
+```javascript
+// ERRADO — trata todo 401 como "token expirou"
+async function fetchWithAuth(url) {
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }});
+  if (res.status === 401) {
+    await refresh(); // E se for 401 de permissão do Buskar?
+    return fetchWithAuth(url); // Loop infinito em recurso não autorizado!
+  }
+}
+```
+
+**Correção:** Verifique se o erro é do auth layer (`invalid token`, `missing authorization header`, `invalid authorization header`). Product 401 (permissão negada, tenant errado) não deve disparar refresh.
+
 ### ❌ Loop Infinito de Refresh
 
 ```javascript
@@ -860,11 +1052,55 @@ interceptor.onError = async (error) => {
 
 **Correção:** Use mutex/flag `isRefreshing` e fila de requests pendentes.
 
+### ❌ Refresh Sem Coordenação Multi-Tab
+
+```javascript
+// ERRADO — flag isRefreshing só existe nesta tab
+let isRefreshing = false;
+
+async function handleUnauthorized() {
+  if (isRefreshing) return; // Não protege contra OUTRA tab
+  isRefreshing = true;
+  await refresh(); // Tab A e Tab B enviam o mesmo refresh token!
+  // → Reuse detection → família revogada → logout forçado
+}
+```
+
+**Correção:** Use `navigator.locks` ou leader-election via localStorage + `BroadcastChannel` para sincronizar refresh entre tabs. Veja implementação na seção [Refresh](#fluxo-refresh-com-proteção-contra-loop-infinito).
+
+### ❌ Logout Só Local (Não Chama API)
+
+```javascript
+// ERRADO — refresh token continua válido no servidor
+function logout() {
+  localStorage.removeItem('refresh_token');
+  window.location.href = '/login';
+  // Atacante com refresh token ainda pode usá-lo por até 14 dias!
+}
+```
+
+**Correção:** Sempre chame `POST /v1/auth/logout` com Bearer access antes de limpar storage. Se access já expirou, faça best-effort (a chamada falhará, mas limpe local de qualquer forma — refresh ficará ativo até TTL ou reuse detection).
+
+```javascript
+async function logout() {
+  if (accessToken) {
+    try {
+      await fetch(`${AUTH_BASE_URL}/v1/auth/logout`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
+    } catch { /* best-effort */ }
+  }
+  clearTokens();
+  window.location.href = '/login';
+}
+```
+
 ---
 
 ## Logout
 
-Para logout explícito do usuário:
+Para logout explícito do usuário. **Importante:** sempre chame a API antes de limpar tokens locais.
 
 ### Request
 
@@ -884,7 +1120,51 @@ HTTP/1.1 200 OK
 }
 ```
 
-O logout revoga todos os refresh tokens do usuário. O access token atual continua válido até expirar (stateless), mas não poderá ser renovado.
+### Comportamento
+
+- Revoga **todos** os refresh tokens do usuário (server-side)
+- O access token atual continua válido até expirar (stateless), mas não poderá ser renovado
+- Se não chamar a API, o refresh token permanece válido por até 14 dias (ou até reuse detection)
+
+### Implementação Correta
+
+```javascript
+async function logout() {
+  // 1. Tenta revogar no servidor (best-effort)
+  if (accessToken) {
+    try {
+      await fetch('https://auth.example.com/v1/auth/logout', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${accessToken}` },
+      });
+    } catch {
+      // Se access já expirou, a chamada falha.
+      // Refresh fica ativo até TTL/reuse, mas não há como revogar sem access válido.
+    }
+  }
+
+  // 2. Limpa storage local
+  clearTokens();
+
+  // 3. Notifica outras tabs (se usando BroadcastChannel)
+  tokenChannel.postMessage({ type: 'LOGGED_OUT' });
+
+  // 4. Redireciona
+  window.location.href = '/login';
+}
+```
+
+### E se o access já expirou?
+
+Se o usuário ficou inativo e o access expirou antes de clicar "Sair":
+
+1. A chamada ao logout falhará com 401
+2. Limpe os tokens locais de qualquer forma
+3. O refresh token permanecerá ativo no servidor até:
+   - Seu TTL de 14 dias expirar, ou
+   - Alguém tentar usá-lo (reuse detection se já foi usado)
+
+Para cenários de alta segurança, considere chamar logout **antes** do access expirar (ex: em `beforeunload` ou timeout).
 
 ---
 
