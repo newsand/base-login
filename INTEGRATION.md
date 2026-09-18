@@ -1,6 +1,6 @@
 # Guia de Integração — LoginBuskar
 
-> **Versão:** 1.1 (2026-09-18) — Corrigido: distinção auth vs product 401, race multi-tab, logout server-side.
+> **Versão:** 1.2 (2026-09-18) — Adicionado: check local de exp + contrato recomendado para product APIs.
 
 Guia para clientes (front-ends, BFFs, apps mobile) consumirem o serviço de autenticação.
 
@@ -187,59 +187,130 @@ HTTP/1.1 200 OK
 
 O refresh token renova o access token antes/após expiração. **Crítico:** implemente proteção contra loop infinito de refresh.
 
-### Distinção: Auth 401 vs Product 401
+### Quando Fazer Refresh
 
-**Nem todo 401 significa "access expirou".** Você deve distinguir:
+**Nem todo 401 significa "access expirou".** Faça refresh quando **qualquer** destas condições for verdadeira:
 
-| Origem do 401 | Causa | Ação Correta |
-|---------------|-------|--------------|
-| **Auth layer** (LoginBuskar / JWT middleware) | Access JWT expirado, inválido, ou ausente | Tenta refresh **uma vez** |
-| **Product API** (Buskar, Vistoria, etc.) | Permissão negada, tenant errado, recurso não autorizado | **NÃO** faz refresh — exibe erro ao usuário |
+| Condição | Como Verificar | Ação |
+|----------|----------------|------|
+| **1. JWT expirado localmente** | Decode payload (base64url), verifique `exp < now` | Refresh **antes** da requisição (proativo) |
+| **2. Auth 401 do LoginBuskar** | Body contém erro conhecido (ver abaixo) | Refresh após 401 |
+| **3. Auth 401 padronizado de produto** | Body ou header indica auth expirado (ver contrato) | Refresh após 401 |
 
-**Como identificar um auth 401:**
+**NÃO faça refresh** em 401/403 de **autorização** (permissão negada, tenant errado, recurso não autorizado) — exiba erro ao usuário.
 
-O LoginBuskar retorna erros conhecidos no body. Faça refresh **apenas** quando o erro for um destes:
+### Verificação Local de Expiração (Proativa)
+
+Antes de cada requisição, verifique se o JWT já expirou localmente. Isso evita requisições desnecessárias e resolve o problema de product APIs que retornam 401 genérico.
+
+```javascript
+function isAccessExpired() {
+  if (!accessToken) return true;
+  
+  try {
+    // Decode payload (segunda parte do JWT) — NÃO verifica assinatura
+    const [, payloadB64] = accessToken.split('.');
+    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    
+    // Margem de 30s para evitar race com clock skew
+    return payload.exp * 1000 < Date.now() + 30000;
+  } catch {
+    return true; // Token malformado → trata como expirado
+  }
+}
+```
+
+### Erros Conhecidos do LoginBuskar (Auth 401)
+
+Faça refresh quando o body do 401 for **exatamente** um destes:
 
 - `{"error": "invalid token"}`
 - `{"error": "missing authorization header"}`
 - `{"error": "invalid authorization header"}`
 
-Qualquer outro 401 (ex: `{"error": "forbidden"}`, `{"error": "not authorized"}`, ou estrutura diferente de produto) **não** deve disparar refresh — é falha de autorização do produto, não expiração de JWT.
+### Contrato Recomendado para Product APIs (Buskar, Vistoria, etc.)
+
+**Problema:** Product APIs frequentemente usam middleware genérico que retorna 401 sem body padronizado quando o JWT expira. O cliente não consegue distinguir de erros de autorização.
+
+**Solução recomendada:** Product APIs devem emitir **um** destes quando o JWT está expirado/inválido:
+
+| Opção | Formato | Exemplo |
+|-------|---------|---------|
+| **A. Body padronizado** | `{"error": "invalid token"}` | Igual ao LoginBuskar |
+| **B. Header WWW-Authenticate** | `Bearer error="invalid_token"` | RFC 6750 |
+| **C. Código estável** | `{"code": "AUTH_EXPIRED", ...}` | Extensível |
+
+O cliente deve tratar qualquer uma dessas como auth 401 → refresh.
+
+```javascript
+// Erros que indicam "auth expirado" (refresh)
+const AUTH_ERRORS = new Set([
+  'invalid token',
+  'missing authorization header',
+  'invalid authorization header',
+]);
+
+// Códigos estáveis de produto que indicam auth expirado
+const AUTH_EXPIRED_CODES = new Set([
+  'AUTH_EXPIRED',
+  'TOKEN_EXPIRED',
+  'INVALID_TOKEN',
+]);
+
+function isAuthExpiredResponse(response, body) {
+  if (response.status !== 401) return false;
+  
+  // Opção A: erro conhecido do LoginBuskar
+  if (body?.error && AUTH_ERRORS.has(body.error)) return true;
+  
+  // Opção B: WWW-Authenticate header (RFC 6750)
+  const wwwAuth = response.headers.get('WWW-Authenticate') || '';
+  if (wwwAuth.includes('error="invalid_token"')) return true;
+  
+  // Opção C: código estável de produto
+  if (body?.code && AUTH_EXPIRED_CODES.has(body.code)) return true;
+  
+  return false;
+}
+```
+
+**Se seu product API não segue este contrato:** O cliente usará a verificação local de `exp` (proativa) e fará refresh antes de enviar requisições com JWT expirado.
 
 ### Algoritmo Obrigatório
 
 ```
-QUANDO receber 401:
-  1. VERIFICA se é auth 401:
-     - Parse response body
-     - SE error ∈ {"invalid token", "missing authorization header", 
-                   "invalid authorization header"}:
-       → É auth 401
-     - SENÃO:
-       → É product 401 → NÃO faz refresh → exibe erro → PARA
+ANTES de cada requisição protegida:
+  SE isAccessExpired() (exp local < now + 30s):
+    → Faz refresh PROATIVO (antes de enviar a requisição)
+    → SE refresh falha → logout
 
-  2. SE é auth 401:
-     SE já estou fazendo refresh (flag isRefreshing = true):
-       → NÃO tente refresh novamente
-       → Espera na fila ou falha
-     
-     SE refresh já falhou nesta sessão (flag refreshFailed = true):
-       → logout() → POST /v1/auth/logout + limpa tokens → redireciona
-       → NÃO tente refresh
-     
-     SENÃO:
-       → isRefreshing = true
-       → tenta POST /v1/auth/refresh
+APÓS receber resposta:
+  SE status = 401:
+    1. Parse response body (clone para não consumir)
+    
+    2. VERIFICA se é auth-expired:
+       - SE body.error ∈ {"invalid token", "missing authorization header", 
+                          "invalid authorization header"}:
+         → É auth 401 ✓
+       - SE header WWW-Authenticate contém error="invalid_token":
+         → É auth 401 ✓
+       - SE body.code ∈ {"AUTH_EXPIRED", "TOKEN_EXPIRED", "INVALID_TOKEN"}:
+         → É auth 401 ✓
+       - SENÃO:
+         → É authorization failure → NÃO faz refresh → exibe erro → PARA
+
+    3. SE é auth 401:
+       SE refresh já falhou nesta sessão (flag refreshFailed = true):
+         → logout() → PARA
        
-       SE refresh sucesso:
-         → armazena novos tokens (broadcast para outras tabs)
-         → isRefreshing = false
-         → retry da requisição original (UMA vez só)
-       
-       SE refresh falha (401):
-         → refreshFailed = true
-         → isRefreshing = false
-         → logout() → POST /v1/auth/logout + limpa tokens → redireciona
+       SENÃO:
+         → Faz refresh (com lock multi-tab)
+         → SE refresh sucesso:
+           → armazena novos tokens (broadcast para outras tabs)
+           → retry da requisição original (UMA vez só)
+         → SE refresh falha:
+           → refreshFailed = true
+           → logout()
 ```
 
 ### ⚠️ WARNING: Race Condition Multi-Tab
@@ -259,10 +330,19 @@ QUANDO receber 401:
 // CONFIGURAÇÃO
 // ============================================================
 const AUTH_BASE_URL = 'https://auth.example.com';
+
+// Erros conhecidos do LoginBuskar
 const AUTH_ERRORS = new Set([
   'invalid token',
   'missing authorization header',
   'invalid authorization header',
+]);
+
+// Códigos estáveis de produto que indicam auth expirado
+const AUTH_EXPIRED_CODES = new Set([
+  'AUTH_EXPIRED',
+  'TOKEN_EXPIRED',
+  'INVALID_TOKEN',
 ]);
 
 // ============================================================
@@ -270,7 +350,6 @@ const AUTH_ERRORS = new Set([
 // ============================================================
 let accessToken = null;
 let refreshFailed = false;
-let pendingRequests = [];
 
 // Canal para sincronizar tokens entre tabs
 const tokenChannel = new BroadcastChannel('auth_tokens');
@@ -286,7 +365,7 @@ tokenChannel.onmessage = (event) => {
 };
 
 // ============================================================
-// FUNÇÕES PRINCIPAIS
+// FUNÇÕES DE TOKEN
 // ============================================================
 
 function storeTokens(tokens) {
@@ -312,85 +391,103 @@ function broadcastLogout() {
 }
 
 // ============================================================
-// VERIFICAÇÃO DE AUTH 401
+// VERIFICAÇÃO LOCAL DE EXPIRAÇÃO (PROATIVA)
 // ============================================================
 
-async function isAuthError(response) {
+function isAccessExpired() {
+  if (!accessToken) return true;
+  
+  try {
+    // Decode payload (segunda parte do JWT) — NÃO verifica assinatura
+    const [, payloadB64] = accessToken.split('.');
+    const payload = JSON.parse(
+      atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/'))
+    );
+    
+    // Margem de 30s para evitar race com clock skew
+    return payload.exp * 1000 < Date.now() + 30000;
+  } catch {
+    return true; // Token malformado → trata como expirado
+  }
+}
+
+// ============================================================
+// VERIFICAÇÃO DE AUTH 401 (REATIVA)
+// ============================================================
+
+async function isAuthExpiredResponse(response) {
   if (response.status !== 401) return false;
   
+  // Opção B: WWW-Authenticate header (RFC 6750)
+  const wwwAuth = response.headers.get('WWW-Authenticate') || '';
+  if (wwwAuth.includes('error="invalid_token"')) return true;
+  
+  // Opções A e C: verificar body
   try {
     const cloned = response.clone();
     const body = await cloned.json();
-    return AUTH_ERRORS.has(body.error);
+    
+    // Opção A: erro conhecido do LoginBuskar
+    if (body.error && AUTH_ERRORS.has(body.error)) return true;
+    
+    // Opção C: código estável de produto
+    if (body.code && AUTH_EXPIRED_CODES.has(body.code)) return true;
   } catch {
-    return false;
+    // Body não é JSON — não é auth error conhecido
   }
+  
+  return false;
 }
 
 // ============================================================
-// FETCH COM AUTH
+// REFRESH (com coordenação multi-tab)
 // ============================================================
 
-async function fetchWithAuth(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      ...options.headers,
-      'Authorization': `Bearer ${accessToken}`,
-    },
-  });
+async function doRefresh() {
+  return navigator.locks.request(
+    'auth_refresh_lock',
+    { mode: 'exclusive' },
+    async () => {
+      // Verifica se outra tab já fez refresh enquanto esperávamos o lock
+      // (accessToken pode ter sido atualizado via BroadcastChannel)
+      if (!isAccessExpired()) {
+        return null; // Já foi renovado por outra tab
+      }
+      
+      const currentRefresh = localStorage.getItem('refresh_token');
+      if (!currentRefresh) {
+        throw new Error('No refresh token');
+      }
 
-  // Só tenta refresh se for auth 401 E não for retry
-  if (response.status === 401 && !options._isRetry && await isAuthError(response)) {
-    return handleAuthUnauthorized(url, options);
-  }
+      const response = await fetch(`${AUTH_BASE_URL}/v1/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: currentRefresh }),
+      });
 
-  return response;
+      if (!response.ok) {
+        throw new Error('Refresh failed');
+      }
+
+      return response.json();
+    }
+  );
 }
 
-// ============================================================
-// HANDLER DE AUTH 401 (com coordenação multi-tab)
-// ============================================================
-
-async function handleAuthUnauthorized(url, options) {
+async function ensureValidToken() {
+  if (!isAccessExpired()) return;
+  
   if (refreshFailed) {
     await logout();
     throw new Error('Session expired');
   }
-
+  
   try {
-    // navigator.locks garante que apenas UMA tab (ou request) faz refresh
-    const newTokens = await navigator.locks.request(
-      'auth_refresh_lock',
-      { mode: 'exclusive' },
-      async () => {
-        // Verifica se outra tab já fez refresh enquanto esperávamos o lock
-        const currentRefresh = localStorage.getItem('refresh_token');
-        if (!currentRefresh) {
-          throw new Error('No refresh token');
-        }
-
-        const response = await fetch(`${AUTH_BASE_URL}/v1/auth/refresh`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refresh_token: currentRefresh }),
-        });
-
-        if (!response.ok) {
-          throw new Error('Refresh failed');
-        }
-
-        return response.json();
-      }
-    );
-
-    // Atualiza tokens localmente e notifica outras tabs
-    storeTokens(newTokens);
-    broadcastTokens(newTokens);
-
-    // Retry da requisição original (UMA vez só)
-    return fetchWithAuth(url, { ...options, _isRetry: true });
-
+    const newTokens = await doRefresh();
+    if (newTokens) {
+      storeTokens(newTokens);
+      broadcastTokens(newTokens);
+    }
   } catch (error) {
     refreshFailed = true;
     await logout();
@@ -399,21 +496,60 @@ async function handleAuthUnauthorized(url, options) {
 }
 
 // ============================================================
+// FETCH COM AUTH
+// ============================================================
+
+async function fetchWithAuth(url, options = {}) {
+  // PROATIVO: renova token antes da requisição se expirado
+  if (!options._isRetry) {
+    await ensureValidToken();
+  }
+  
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      'Authorization': `Bearer ${accessToken}`,
+    },
+  });
+
+  // REATIVO: trata auth 401 (caso servidor rejeite mesmo após check local)
+  if (response.status === 401 && !options._isRetry) {
+    if (await isAuthExpiredResponse(response)) {
+      // Tenta refresh e retry
+      try {
+        const newTokens = await doRefresh();
+        if (newTokens) {
+          storeTokens(newTokens);
+          broadcastTokens(newTokens);
+        }
+        return fetchWithAuth(url, { ...options, _isRetry: true });
+      } catch (error) {
+        refreshFailed = true;
+        await logout();
+        throw error;
+      }
+    }
+    // Não é auth expired → é authorization failure → retorna response original
+  }
+
+  return response;
+}
+
+// ============================================================
 // LOGOUT (DEVE CHAMAR A API)
 // ============================================================
 
 async function logout() {
   // Best-effort: tenta revogar refresh no servidor
-  // Se access já expirou, a chamada falhará, mas prosseguimos
-  if (accessToken) {
+  if (accessToken && !isAccessExpired()) {
     try {
       await fetch(`${AUTH_BASE_URL}/v1/auth/logout`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${accessToken}` },
       });
     } catch {
-      // Ignora erro — refresh pode ficar ativo até TTL/reuse,
-      // mas não podemos fazer mais nada sem access válido
+      // Ignora erro — refresh pode ficar ativo até TTL/reuse
     }
   }
 
@@ -963,7 +1099,20 @@ async function fetchWithAuth(url) {
 }
 ```
 
-**Correção:** Verifique se o erro é do auth layer (`invalid token`, `missing authorization header`, `invalid authorization header`). Product 401 (permissão negada, tenant errado) não deve disparar refresh.
+**Correção:** Use verificação proativa de `exp` local + body/header matching para auth 401. Product 401 (permissão negada, tenant errado) não deve disparar refresh.
+
+### ❌ Só Verificar Body sem Check Local de Exp
+
+```javascript
+// ERRADO — product API pode retornar 401 genérico sem body padronizado
+async function isAuthError(response) {
+  const body = await response.clone().json();
+  return AUTH_ERRORS.has(body.error); // false se product API não segue contrato!
+}
+// → Cliente nunca faz refresh → fica preso
+```
+
+**Correção:** Verifique `exp` localmente **antes** de cada requisição. O check proativo resolve o caso de product APIs com 401 genérico.
 
 ### ❌ Loop Infinito de Refresh
 
