@@ -230,6 +230,10 @@ Tables: `users`, `refresh_tokens`, `invites`, `magic_tokens`, `recover_tokens`, 
 - **Account Lockout**: In-memory per-account/IP. Configure via `LOCKOUT_*` vars. Same multi-replica caveat as rate limiting.
 - **Soft-disable**: When a user is disabled via `PATCH /users/:id`, all refresh tokens are revoked immediately. However, existing **access JWTs remain valid until their TTL** (~15 min). Middleware does not re-check `disabled_at` on every request in this MVP.
 
+## Client Integration
+
+See **[INTEGRATION.md](INTEGRATION.md)** for the client integration guide — covers all auth flows (login, refresh, 2FA, password recovery, invite, magic link), token storage recommendations, error reference, and anti-patterns checklist.
+
 ## Specs
 
 See `AUTH-MVP.md` for product rules and `SPEC-DRIVEN.md` for architecture decisions.
